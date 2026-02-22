@@ -23,8 +23,9 @@ ORBIT_COOLDOWN_SEC   = 60
 SAMPLE_SEC           = 1.0
 FIELD_ELEV_FT        = 0
 GPS_DEVICE           = "/dev/ttyAMA0"
-ORBIT_HEADING_THRESHOLD = 270
-ORBIT_TIME_WINDOW    = 120
+ORBIT_HEADING_THRESHOLD  = 270
+ORBIT_TIME_WINDOW        = 120
+ORBIT_MIN_TURN_RATE_DPS  = 1.5   # deg/s — filters slow heading drift from true orbits
 REG_DB_PATH          = "/etc/adsb-alert/reg.json"
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
@@ -246,13 +247,20 @@ class OrbitTracker:
         entries = self._history[hexid]
         if len(entries) < 6:
             return False
+        time_span = entries[-1][0] - entries[0][0]
+        if time_span < 10:
+            return False
         total_turn = 0.0
         prev = entries[0][1]
         for _, heading in list(entries)[1:]:
             diff = (heading - prev + 180) % 360 - 180
             total_turn += diff
             prev = heading
-        return abs(total_turn) >= ORBIT_HEADING_THRESHOLD
+        if abs(total_turn) < ORBIT_HEADING_THRESHOLD:
+            return False
+        # Require a sustained turn rate so normal gradual course changes
+        # don't accumulate enough degrees to look like an orbit.
+        return (abs(total_turn) / time_span) >= ORBIT_MIN_TURN_RATE_DPS
 
     def cleanup(self, active_hexids):
         for hexid in list(self._history.keys()):
@@ -264,6 +272,10 @@ class OrbitTracker:
 class AudioEngine:
     def __init__(self):
         self._lock = threading.Lock()
+        # Allow at most 2 slots: one currently playing + one queued.
+        # Any additional requests are dropped so old alerts don't play
+        # out long after the threat has passed.
+        self._slots = threading.Semaphore(2)
 
     def _run_blocking(self, cmd):
         """Run an audio process and wait for it to finish before returning."""
@@ -273,11 +285,16 @@ class AudioEngine:
             pass
 
     def speak(self, text):
+        if not self._slots.acquire(blocking=False):
+            return  # queue full — drop stale alert
         def _do():
-            with self._lock:
-                self._run_blocking(
-                    ["espeak-ng", "-s", "150", "-p", "45", "-a", "200", text]
-                )
+            try:
+                with self._lock:
+                    self._run_blocking(
+                        ["espeak-ng", "-s", "150", "-p", "45", "-a", "200", text]
+                    )
+            finally:
+                self._slots.release()
         threading.Thread(target=_do, daemon=True).start()
 
     def _try_beep(self, freq, dur_ms):
@@ -311,12 +328,17 @@ class AudioEngine:
                 pass
 
     def beep(self, freq=880, dur_ms=120, count=1, gap_ms=80):
+        if not self._slots.acquire(blocking=False):
+            return  # queue full — drop stale alert
         def _do():
-            with self._lock:
-                for i in range(count):
-                    self._try_beep(freq, dur_ms)
-                    if i < count - 1:
-                        time.sleep(gap_ms / 1000)
+            try:
+                with self._lock:
+                    for i in range(count):
+                        self._try_beep(freq, dur_ms)
+                        if i < count - 1:
+                            time.sleep(gap_ms / 1000)
+            finally:
+                self._slots.release()
         threading.Thread(target=_do, daemon=True).start()
 
     def caution_tone(self):  self.beep(880,  120)
@@ -773,7 +795,7 @@ class ADSBMonitorApp:
             lon   = ac.get("lon")
             if not hexid or lat is None or lon is None:
                 continue
-            alt = ac.get("alt_geom", ac.get("alt_baro"))
+            alt = ac.get("alt_baro", ac.get("alt_geom"))  # baro is MSL like FIELD_ELEV_FT
             if alt is None or isinstance(alt, str):
                 continue
             dist = haversine_miles(my_lat, my_lon, lat, lon)
@@ -808,7 +830,11 @@ class ADSBMonitorApp:
                         # first-contact aircraft whose closing_mph is None.
                         if closing_mph is not None and closing_mph >= MIN_CLOSING_MPH:
                             is_threat = True
-                elif closing_mph is not None and closing_mph >= MIN_CLOSING_MPH:
+                elif (closing_mph is not None and closing_mph >= MIN_CLOSING_MPH
+                      and dist <= RING_WARN_MI):
+                    # No heading data — only flag as threat when already inside
+                    # the warning ring; beyond that we cannot distinguish a
+                    # closing aircraft from a vehicle on a nearby road.
                     is_threat = True
 
             if dist <= RING_DANGER_MI:   level = 2
