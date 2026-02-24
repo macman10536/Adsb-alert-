@@ -16,11 +16,14 @@ MIN_CLOSING_MPH     = 5
 WARN_COOLDOWN_SEC   = 25
 DANGER_COOLDOWN_SEC = 4
 ORBIT_COOLDOWN_SEC  = 60
+WATCH_COOLDOWN_SEC  = 1800
 SAMPLE_SEC          = 1.0
 FIELD_ELEV_FT       = 0
 GPS_DEVICE          = "/dev/ttyAMA0"
 ORBIT_HEADING_THRESHOLD = 270
 ORBIT_TIME_WINDOW   = 120
+WATCHLIST_FILE      = os.path.expanduser("~/.adsb_watchlist")
+LOG_MAX_LINES       = 500
 
 DB_CANDIDATES = [
     "/usr/share/tar1090/html/db/aircraft.json",
@@ -79,6 +82,29 @@ def fix_gps_setup():
         pass
     time.sleep(2)
 
+def load_watchlist():
+    try:
+        with open(WATCHLIST_FILE) as f:
+            entries = [line.strip().upper() for line in f if line.strip()]
+            return entries[:10]
+    except Exception:
+        return []
+
+def save_watchlist(entries):
+    try:
+        with open(WATCHLIST_FILE, "w") as f:
+            for e in entries:
+                f.write(e + "\n")
+    except Exception:
+        pass
+
+def matches_watchlist(ident_set, watchlist):
+    for watch in watchlist:
+        for ident in ident_set:
+            if ident.endswith(watch) or ident == watch:
+                return True
+    return False
+
 @dataclass
 class Aircraft:
     hexid: str
@@ -95,6 +121,7 @@ class Aircraft:
     threat_level: int
     bearing_from_me: float
     is_orbiting: bool = False
+    is_watched: bool = False
 
     @property
     def ident(self):
@@ -209,6 +236,9 @@ class AudioEngine:
     def orbit_tone(self):
         self.beep(freq=520, dur_ms=300, count=2, gap_ms=200)
 
+    def watch_tone(self):
+        self.beep(freq=750, dur_ms=200, count=2, gap_ms=150)
+
 
 class RadarWidget(tk.Canvas):
     def __init__(self, parent, size=240, on_select=None, **kw):
@@ -223,8 +253,10 @@ class RadarWidget(tk.Canvas):
         self._all_aircraft = []
         self._selected_hexid = None
         self._on_select = on_select
+        self._blink_state = False
         self._draw_static()
         self._animate_sweep()
+        self._animate_blink()
         self.bind("<Button-1>", self._on_click)
 
     def _draw_static(self):
@@ -276,6 +308,11 @@ class RadarWidget(tk.Canvas):
         self._sweep_angle = (self._sweep_angle + 2) % 360
         self.after(80, self._animate_sweep)
 
+    def _animate_blink(self):
+        self._blink_state = not self._blink_state
+        self._redraw_aircraft()
+        self.after(500, self._animate_blink)
+
     def _ac_screen_pos(self, ac):
         angle_rad = math.radians(ac.bearing_from_me - 90)
         frac = min(ac.dist_mi / RING_CAUTION_MI, 1.0)
@@ -298,51 +335,55 @@ class RadarWidget(tk.Canvas):
 
     def update_aircraft(self, threats, safe):
         self._all_aircraft = threats + safe
+        self._redraw_aircraft()
+
+    def _redraw_aircraft(self):
         self.delete("dynamic")
         self.create_oval(self.cx-5, self.cy-5, self.cx+5, self.cy+5,
                          fill=C["green_radar"], outline=C["green_radar"], tags="dynamic")
         self.create_text(self.cx, self.cy+14, text="YOU",
                          fill=C["green_radar"], font=("Courier", 8, "bold"), tags="dynamic")
-        for ac in safe:
+        for ac in self._all_aircraft:
             px, py = self._ac_screen_pos(ac)
-            color = C["cyan"] if ac.is_orbiting else C["blue"]
             is_sel = ac.hexid == self._selected_hexid
-            size = 6 if is_sel else 4
-            self.create_oval(px-size, py-size, px+size, py+size,
-                             fill=color,
-                             outline="white" if is_sel else "",
-                             width=2 if is_sel else 0,
-                             tags="dynamic")
-            if ac.track is not None:
-                tr = math.radians(ac.track - 90)
-                ax = px + 12 * math.cos(tr)
-                ay = py + 12 * math.sin(tr)
-                self.create_line(px, py, ax, ay, fill=color,
-                                 width=1, arrow=tk.LAST, arrowshape=(5, 7, 2),
-                                 tags="dynamic")
-        for ac in threats:
-            px, py = self._ac_screen_pos(ac)
-            if ac.is_orbiting and ac.threat_level == 0:
-                color = C["cyan"]
+            if ac.is_watched:
+                color = C["red"] if self._blink_state else C["red_dim"]
+                size = 7 if is_sel else 5
+                self.create_oval(px-size, py-size, px+size, py+size,
+                                 fill=color, outline="white" if is_sel else "",
+                                 width=2 if is_sel else 0, tags="dynamic")
+                self.create_text(px+8, py-10, text=ac.ident[:10],
+                                 fill=color, font=("Courier", 8, "bold"),
+                                 anchor="w", tags="dynamic")
+            elif ac.threat_level > 0:
+                color = [C["yellow"], C["orange"], C["red"]][ac.threat_level - 1]
+                size = 8 if is_sel else 6
+                self.create_oval(px-size, py-size, px+size, py+size,
+                                 fill=color, outline="white" if is_sel else "",
+                                 width=2 if is_sel else 0, tags="dynamic")
+                if ac.track is not None:
+                    tr = math.radians(ac.track - 90)
+                    ax = px + 16 * math.cos(tr)
+                    ay = py + 16 * math.sin(tr)
+                    self.create_line(px, py, ax, ay, fill=color,
+                                     width=2, arrow=tk.LAST, arrowshape=(7, 9, 3),
+                                     tags="dynamic")
+                self.create_text(px+8, py-10, text=ac.ident[:10],
+                                 fill=color, font=("Courier", 8, "bold"),
+                                 anchor="w", tags="dynamic")
             else:
-                color = [C["yellow"], C["orange"], C["red"]][ac.threat_level]
-            is_sel = ac.hexid == self._selected_hexid
-            size = 8 if is_sel else 6
-            self.create_oval(px-size, py-size, px+size, py+size,
-                             fill=color,
-                             outline="white" if is_sel else "",
-                             width=2 if is_sel else 0,
-                             tags="dynamic")
-            if ac.track is not None:
-                tr = math.radians(ac.track - 90)
-                ax = px + 16 * math.cos(tr)
-                ay = py + 16 * math.sin(tr)
-                self.create_line(px, py, ax, ay, fill=color,
-                                 width=2, arrow=tk.LAST, arrowshape=(7, 9, 3),
-                                 tags="dynamic")
-            self.create_text(px+8, py-10, text=ac.ident[:10],
-                             fill=color, font=("Courier", 8, "bold"),
-                             anchor="w", tags="dynamic")
+                color = C["cyan"] if ac.is_orbiting else C["blue"]
+                size = 6 if is_sel else 4
+                self.create_oval(px-size, py-size, px+size, py+size,
+                                 fill=color, outline="white" if is_sel else "",
+                                 width=2 if is_sel else 0, tags="dynamic")
+                if ac.track is not None:
+                    tr = math.radians(ac.track - 90)
+                    ax = px + 12 * math.cos(tr)
+                    ay = py + 12 * math.sin(tr)
+                    self.create_line(px, py, ax, ay, fill=color,
+                                     width=1, arrow=tk.LAST, arrowshape=(5, 7, 2),
+                                     tags="dynamic")
 class AlertBanner(tk.Frame):
     def __init__(self, parent, **kw):
         super().__init__(parent, **kw)
@@ -376,6 +417,11 @@ class AlertBanner(tk.Frame):
         self._stop_blink()
         self.lbl.config(text=f"  SKY CIRCLE  --  {msg}  ",
                         bg=C["blue_dim"], fg=C["cyan"])
+
+    def set_watch(self, msg):
+        self._stop_blink()
+        self.lbl.config(text=f"  WATCHLIST  --  {msg}  ",
+                        bg=C["red_dim"], fg=C["red_bright"])
 
     def _start_blink(self, msg):
         self._stop_blink()
@@ -429,13 +475,20 @@ class ThreatCard(tk.Frame):
         self.lbl_closing.pack(side="left", padx=10)
 
     def update(self, ac):
-        if ac.is_orbiting and ac.threat_level == 0:
+        if ac.is_watched and ac.threat_level == 0:
+            color = C["red_bright"]
+        elif ac.is_orbiting and ac.threat_level == 0:
             color = C["cyan"]
         else:
-            color = [C["yellow"], C["orange"], C["red"]][ac.threat_level]
+            color = [C["yellow"], C["orange"], C["red"]][min(ac.threat_level, 2)]
         self.level_bar.config(bg=color)
-        orbit_tag = " [CIRCLING]" if ac.is_orbiting else ""
-        self.lbl_ident.config(text=ac.ident + orbit_tag)
+        tags = []
+        if ac.is_orbiting:
+            tags.append("[ORBIT]")
+        if ac.is_watched:
+            tags.append("[WATCH]")
+        tag_str = " ".join(tags)
+        self.lbl_ident.config(text=ac.ident + (f" {tag_str}" if tag_str else ""))
         self.lbl_dist.config(text=f"{ac.dist_mi:.2f} mi", fg=color)
         self.lbl_eta.config(text=ac.eta_str)
         self.lbl_alt.config(text=f"{ac.alt_ft}ft MSL  ({ac.alt_agl:+d}ft AGL)")
@@ -470,9 +523,6 @@ class SelectedPanel(tk.Frame):
         self.lbl_spd = tk.Label(body, text="", bg=C["panel"],
                                 fg=C["text"], font=("Courier New", 10))
         self.lbl_spd.pack(anchor="w")
-        self.lbl_dir = tk.Label(body, text="", bg=C["panel"],
-                                fg=C["text"], font=("Courier New", 10))
-        self.lbl_dir.pack(anchor="w")
         self.lbl_status = tk.Label(body, text="", bg=C["panel"],
                                    fg=C["cyan"], font=("Courier New", 10, "bold"))
         self.lbl_status.pack(anchor="w")
@@ -480,30 +530,94 @@ class SelectedPanel(tk.Frame):
     def update(self, ac):
         if ac is None:
             self.lbl_ident.config(text="--")
-            for lbl in [self.lbl_dist, self.lbl_alt, self.lbl_spd,
-                        self.lbl_dir, self.lbl_status]:
+            for lbl in [self.lbl_dist, self.lbl_alt, self.lbl_spd, self.lbl_status]:
                 lbl.config(text="")
             return
         self.lbl_ident.config(text=ac.ident)
         compass = bearing_to_compass(ac.bearing_from_me)
         self.lbl_dist.config(text=f"{ac.dist_mi:.2f} mi  {compass}")
         self.lbl_alt.config(text=f"{ac.alt_ft}ft MSL  ({ac.alt_agl:+d}ft AGL)")
-        spd = f"{ac.speed_kts:.0f}kts" if ac.speed_kts else "--- kts"
+        spd = f"{ac.speed_kts:.0f}kts" if ac.speed_kts else "---kts"
         trk = f"  HDG {ac.track:.0f}" if ac.track else ""
         self.lbl_spd.config(text=spd + trk)
-        closing = f"  closing {ac.closing_str}" if ac.closing_str else ""
-        self.lbl_dir.config(text=f"hex: {ac.hexid.upper()}{closing}")
-        if ac.is_orbiting:
-            status = "CIRCLING"
-        elif ac.threat_level == 2:
-            status = "DANGER"
-        elif ac.threat_level == 1:
-            status = "WARNING"
-        elif ac.closing_mph and ac.closing_mph > 0:
-            status = "CAUTION"
-        else:
-            status = ""
-        self.lbl_status.config(text=status)
+        tags = []
+        if ac.is_watched:   tags.append("WATCHLIST")
+        if ac.is_orbiting:  tags.append("CIRCLING")
+        if ac.threat_level == 2: tags.append("DANGER")
+        elif ac.threat_level == 1: tags.append("WARNING")
+        self.lbl_status.config(
+            text=" | ".join(tags),
+            fg=C["red_bright"] if ac.is_watched else C["cyan"])
+
+
+class WatchlistPanel(tk.Frame):
+    def __init__(self, parent, on_change=None, **kw):
+        super().__init__(parent, bg=C["panel"],
+                         highlightbackground=C["border_bright"],
+                         highlightthickness=1, **kw)
+        self._on_change = on_change
+        tk.Label(self, text="WATCHLIST", bg=C["panel"],
+                 fg=C["text_dim"], font=("Courier New", 9)).pack(anchor="w", padx=6, pady=(3, 0))
+        tk.Frame(self, bg=C["border_bright"], height=1).pack(fill="x")
+        cols = tk.Frame(self, bg=C["panel"])
+        cols.pack(fill="both", expand=True, padx=4, pady=4)
+        self._texts = []
+        self._canvases = []
+        for col in range(2):
+            col_frame = tk.Frame(cols, bg=C["panel"])
+            col_frame.pack(side="left", padx=(0 if col == 0 else 4, 0))
+            t = tk.Text(col_frame, width=8, height=5,
+                        bg=C["bg"], fg=C["red_bright"],
+                        insertbackground=C["red_bright"],
+                        font=("Courier New", 11),
+                        relief="flat",
+                        highlightbackground=C["border_bright"],
+                        highlightthickness=1,
+                        spacing3=4)
+            t.pack()
+            t.bind("<KeyRelease>", self._on_key)
+            self._texts.append(t)
+            c = tk.Canvas(col_frame, bg=C["panel"], height=10,
+                          width=80, highlightthickness=0)
+            c.pack(fill="x")
+            self._draw_dots(c)
+            self._canvases.append(c)
+        self._loading = False
+
+    def _draw_dots(self, canvas):
+        canvas.delete("all")
+        w = 80
+        y = 5
+        x = 2
+        while x < w:
+            canvas.create_line(x, y, x+2, y, fill=C["green_ring"], width=1)
+            x += 6
+
+    def _on_key(self, event):
+        if self._loading:
+            return
+        entries = self.get_entries()
+        if self._on_change:
+            self._on_change(entries)
+
+    def get_entries(self):
+        entries = []
+        for t in self._texts:
+            for line in t.get("1.0", "end").splitlines():
+                val = line.strip().upper()
+                if val:
+                    entries.append(val)
+        return entries[:10]
+
+    def load_entries(self, entries):
+        self._loading = True
+        col1 = entries[:5]
+        col2 = entries[5:10]
+        self._texts[0].delete("1.0", "end")
+        self._texts[0].insert("1.0", "\n".join(col1))
+        self._texts[1].delete("1.0", "end")
+        self._texts[1].insert("1.0", "\n".join(col2))
+        self._loading = False
 
 
 def haversine_miles(lat1, lon1, lat2, lon2):
@@ -603,12 +717,14 @@ class ADSBMonitorApp:
         self.last_dist = {}
         self.last_warn = {}
         self.last_orbit_warn = {}
+        self.last_watch_warn = {}
         self.last_danger_beep = 0
         self.total_ac_seen = 0
         self.sdr_ok = False
         self.threats = []
         self.safe_ac = []
         self.selected_ac = None
+        self.watchlist = load_watchlist()
         self.running = True
         self._build_ui()
         self._start_gps_thread()
@@ -618,6 +734,10 @@ class ADSBMonitorApp:
     def _on_radar_select(self, ac):
         self.selected_ac = ac
         self.selected_panel.update(ac)
+
+    def _on_watchlist_change(self, entries):
+        self.watchlist = entries
+        save_watchlist(entries)
 
     def _build_ui(self):
         topbar = tk.Frame(self.root, bg=C["panel"], height=30)
@@ -699,6 +819,10 @@ class ADSBMonitorApp:
         self.selected_panel = SelectedPanel(left)
         self.selected_panel.pack(fill="x", pady=(4, 0))
 
+        self.watch_panel = WatchlistPanel(left, on_change=self._on_watchlist_change)
+        self.watch_panel.pack(fill="x", pady=(4, 0))
+        self.watch_panel.load_entries(self.watchlist)
+
         right = tk.Frame(body, bg=C["bg"])
         right.pack(side="left", fill="both", expand=True)
 
@@ -717,18 +841,25 @@ class ADSBMonitorApp:
         tk.Label(right, text="ALERT LOG", bg=C["bg"],
                  fg=C["text_dim"], font=("Courier New", 11)).pack(anchor="w", padx=2)
         log_frame = tk.Frame(right, bg=C["panel"],
-                             highlightbackground=C["border_bright"], highlightthickness=1)
+                             highlightbackground=C["border"], highlightthickness=1)
         log_frame.pack(fill="both", expand=True, padx=2)
-        self.log_text = tk.Text(log_frame, bg=C["panel"], fg=C["text_dim"],
+        scrollbar = tk.Scrollbar(log_frame, bg=C["panel"],
+                                 troughcolor=C["bg"],
+                                 activebackground=C["green_radar"])
+        scrollbar.pack(side="right", fill="y")
+        self.log_text = tk.Text(log_frame, bg=C["bg"], fg=C["green"],
                                 font=("Courier New", 11), state="disabled",
-                                wrap="word", relief="flat", cursor="arrow")
+                                wrap="word", relief="flat", cursor="arrow",
+                                yscrollcommand=scrollbar.set)
         self.log_text.pack(fill="both", expand=True, padx=4, pady=2)
-        self.log_text.tag_config("caution", foreground=C["yellow"])
-        self.log_text.tag_config("warning", foreground=C["orange"])
-        self.log_text.tag_config("danger",  foreground=C["red"])
-        self.log_text.tag_config("orbit",   foreground=C["cyan"])
-        self.log_text.tag_config("safe",    foreground=C["blue"])
-        self.log_text.tag_config("info",    foreground=C["text_dim"])
+        scrollbar.config(command=self.log_text.yview)
+        self.log_text.tag_config("caution",  foreground=C["yellow"])
+        self.log_text.tag_config("warning",  foreground=C["orange"])
+        self.log_text.tag_config("danger",   foreground=C["red"])
+        self.log_text.tag_config("orbit",    foreground=C["cyan"])
+        self.log_text.tag_config("watch",    foreground=C["red_bright"])
+        self.log_text.tag_config("safe",     foreground=C["blue"])
+        self.log_text.tag_config("info",     foreground=C["text_dim"])
 
         sbar = tk.Frame(self.root, bg=C["panel"], height=28)
         sbar.pack(fill="x", side="bottom")
@@ -761,7 +892,7 @@ class ADSBMonitorApp:
         self.log_text.insert("end", f"[{ts}] {msg}\n", level)
         self.log_text.see("end")
         lines = int(self.log_text.index("end-1c").split(".")[0])
-        if lines > 200:
+        if lines > LOG_MAX_LINES:
             self.log_text.delete("1.0", "2.0")
         self.log_text.config(state="disabled")
 
@@ -812,6 +943,7 @@ class ADSBMonitorApp:
             self.lbl_pos.config(text=f"{self.my_lat:.4f}, {self.my_lon:.4f}")
         raw_threats = []
         raw_safe = []
+        raw_watched = []
         try:
             with open(AIRCRAFT_JSON) as f:
                 data = json.load(f)
@@ -827,6 +959,8 @@ class ADSBMonitorApp:
             return
 
         active_hexids = set()
+        watchlist_set = set(self.watchlist)
+
         for ac in aircraft_list:
             hexid = ac.get("hex")
             lat = ac.get("lat")
@@ -836,12 +970,26 @@ class ADSBMonitorApp:
             alt = ac.get("alt_geom", ac.get("alt_baro"))
             if alt is None or isinstance(alt, str):
                 continue
+
+            tail   = lookup_tail(self.reg_db, hexid)
+            flight = (ac.get("flight") or "").strip()
+
+            ident_check = set()
+            if tail:   ident_check.add(tail.upper())
+            if flight: ident_check.add(flight.upper())
+            ident_check.add(hexid.upper())
+            is_watched = matches_watchlist(ident_check, watchlist_set)
+
             dist = haversine_miles(self.my_lat, self.my_lon, lat, lon)
-            if dist > RING_CAUTION_MI:
+            bear = bearing_deg(self.my_lat, self.my_lon, lat, lon)
+
+            if not is_watched and dist > RING_CAUTION_MI:
                 continue
+
             active_hexids.add(hexid)
             track = ac.get("track")
             is_orbiting = self.orbit_tracker.update(hexid, track, now)
+
             closing_mph = None
             if hexid in self.last_dist:
                 prev_d, prev_t = self.last_dist[hexid]
@@ -849,10 +997,9 @@ class ADSBMonitorApp:
                 if dt > 0.5:
                     closing_mph = ((prev_d - dist) / dt) * 3600.0
             self.last_dist[hexid] = (dist, now)
-            tail = lookup_tail(self.reg_db, hexid)
-            flight = (ac.get("flight") or "").strip()
+
             eta_sec = eta_seconds(dist, RING_WARN_MI, closing_mph)
-            bear = bearing_deg(self.my_lat, self.my_lon, lat, lon)
+
             is_threat = False
             if alt <= (MAX_ALT_FT + FIELD_ELEV_FT):
                 if track is not None:
@@ -862,12 +1009,11 @@ class ADSBMonitorApp:
                             is_threat = True
                 elif closing_mph is not None and closing_mph >= MIN_CLOSING_MPH:
                     is_threat = True
-            if dist <= RING_DANGER_MI:
-                level = 2
-            elif dist <= RING_WARN_MI:
-                level = 1
-            else:
-                level = 0
+
+            if dist <= RING_DANGER_MI:   level = 2
+            elif dist <= RING_WARN_MI:   level = 1
+            else:                        level = 0
+
             obj = Aircraft(hexid=hexid, lat=lat, lon=lon,
                            alt_ft=int(alt), dist_mi=dist,
                            track=track, speed_kts=ac.get("gs"),
@@ -876,23 +1022,30 @@ class ADSBMonitorApp:
                            eta_1mi_sec=eta_sec,
                            threat_level=level if is_threat else 0,
                            bearing_from_me=bear,
-                           is_orbiting=is_orbiting)
-            if is_threat:
+                           is_orbiting=is_orbiting,
+                           is_watched=is_watched)
+
+            if is_watched:
+                self._handle_watch_alert(obj, now)
+                raw_watched.append(obj)
+            elif is_threat:
                 raw_threats.append(obj)
                 self._handle_threat_alerts(obj, now)
             else:
                 raw_safe.append(obj)
+
             if is_orbiting:
                 self._handle_orbit_alert(obj, now, bear)
 
         self.orbit_tracker.cleanup(active_hexids)
         raw_threats.sort(key=lambda a: a.dist_mi)
         raw_safe.sort(key=lambda a: a.dist_mi)
-        self.threats = raw_threats
+        raw_watched.sort(key=lambda a: a.dist_mi)
+        self.threats = raw_watched + raw_threats
         self.safe_ac = raw_safe
 
         if self.selected_ac:
-            all_ac = raw_threats + raw_safe
+            all_ac = self.threats + raw_safe
             updated = next((a for a in all_ac if a.hexid == self.selected_ac.hexid), None)
             self.selected_ac = updated
             self.selected_panel.update(updated)
@@ -900,6 +1053,18 @@ class ADSBMonitorApp:
         self._update_banner()
         self._update_cards()
         self.radar.update_aircraft(self.threats, self.safe_ac)
+
+    def _handle_watch_alert(self, ac, now):
+        hexid = ac.hexid
+        if now - self.last_watch_warn.get(hexid, 0) >= WATCH_COOLDOWN_SEC:
+            compass = bearing_to_compass(ac.bearing_from_me)
+            msg = f"WATCHLIST: {ac.ident}  {ac.dist_mi:.2f}mi  {compass}  {ac.alt_ft}ft"
+            self._log(msg, "watch")
+            self.audio.watch_tone()
+            self.audio.speak(
+                f"Watchlist aircraft {ac.ident}, "
+                f"{ac.dist_mi:.1f} miles, {compass.lower()}.")
+            self.last_watch_warn[hexid] = now
 
     def _handle_orbit_alert(self, ac, now, bearing):
         hexid = ac.hexid
@@ -949,15 +1114,19 @@ class ADSBMonitorApp:
             self.last_warn[hexid] = now
 
     def _update_banner(self):
-        if self.threats:
-            w = self.threats[0]
+        watched = [a for a in self.threats if a.is_watched]
+        if watched:
+            w = watched[0]
+            compass = bearing_to_compass(w.bearing_from_me)
+            self.banner.set_watch(f"{w.ident}  {w.dist_mi:.2f}mi  {compass}")
+            return
+        threats = [a for a in self.threats if not a.is_watched]
+        if threats:
+            w = threats[0]
             msg = f"{w.ident}  {w.dist_mi:.2f}mi  {w.alt_ft}ft  {w.eta_str}"
-            if w.threat_level == 2:
-                self.banner.set_danger(msg)
-            elif w.threat_level == 1:
-                self.banner.set_warning(msg)
-            else:
-                self.banner.set_caution(msg)
+            if w.threat_level == 2:      self.banner.set_danger(msg)
+            elif w.threat_level == 1:    self.banner.set_warning(msg)
+            else:                        self.banner.set_caution(msg)
             return
         orbiting = [a for a in self.safe_ac if a.is_orbiting]
         if orbiting:
